@@ -168,8 +168,8 @@ class ExportTests(unittest.TestCase):
         count = 40
         starts, texts = [], []
         for index in range(count):
-            hour = (22 + index // 20) % 24
-            day = 10 + (22 + index // 20) // 24
+            hour = (23 + index // 20) % 24
+            day = 10 + (23 + index // 20) // 24
             starts.append(f"2026-03-{day:02d}T{hour:02d}:{index % 60:02d}:00.000Z")
             # Every seventh clip is silence the cleaner rejects, which must not
             # emit a section or disturb the ordering watermark.
@@ -193,6 +193,52 @@ class ExportTests(unittest.TestCase):
         life = (inbox.root / "life.md").read_text()
         self.assertIn("first clip", life)
         self.assertIn("second clip", life)
+
+    def test_a_missing_day_file_is_rebuilt_rather_than_replaced(self):
+        """A day file that vanished must not come back holding only the newest
+        clip while life.md still carries the rest."""
+        inbox = Inbox(self.root)
+        self.populate(inbox, ["2026-03-10T09:00:00.000Z", "2026-03-10T09:01:00.000Z",
+                              "2026-03-10T09:02:00.000Z"])
+        inbox.complete(f"{0:032x}", "first clip")
+        inbox.complete(f"{1:032x}", "second clip")
+        (inbox.days / "2026-03-10.md").unlink()
+        inbox.complete(f"{2:032x}", "third clip")
+        day = (inbox.days / "2026-03-10.md").read_text()
+        for text in ("first clip", "second clip", "third clip"):
+            self.assertIn(text, day)
+
+    def test_a_silent_clip_does_not_bless_a_truncated_day_file(self):
+        """A clip the cleaner rejects writes nothing, so it must not carry the
+        watermark past a day file it never looked at."""
+        inbox = Inbox(self.root)
+        self.populate(inbox, ["2026-03-10T09:00:00.000Z", "2026-03-10T09:01:00.000Z",
+                              "2026-03-10T09:02:00.000Z", "2026-03-10T09:03:00.000Z"])
+        inbox.complete(f"{0:032x}", "first clip")
+        inbox.complete(f"{1:032x}", "second clip")
+        (inbox.days / "2026-03-10.md").write_bytes(b"# 2026-03-10\n\n")
+        inbox.complete(f"{2:032x}", "[BLANK_AUDIO]")
+        inbox.complete(f"{3:032x}", "fourth clip")
+        day = (inbox.days / "2026-03-10.md").read_text()
+        for text in ("first clip", "second clip", "fourth clip"):
+            self.assertIn(text, day)
+
+    def test_audio_that_cannot_be_deleted_is_left_for_the_next_sweep(self):
+        """A stuck file must not fail a transcript that is already durable."""
+        inbox = Inbox(self.root)
+        stuck = inbox.audio / "stuck.m4a"
+        stuck.mkdir()  # unlink() refuses a directory
+        (stuck / "inner").write_bytes(b"audio")
+        with inbox.connect() as db:
+            db.execute("INSERT INTO chunks (id,sha256,device,started,duration,path,received)"
+                       " VALUES (?,?,?,?,?,?,?)",
+                       (f"{0:032x}", "0" * 64, "dev", "2026-03-10T09:00:00.000Z", 60.0,
+                        str(stuck), 0.0))
+        inbox.complete(f"{0:032x}", "spoken words")
+        self.assertIn("spoken words", (inbox.root / "life.md").read_text())
+        with inbox.connect() as db:
+            self.assertEqual(db.execute("SELECT path FROM chunks WHERE id=?",
+                                        (f"{0:032x}",)).fetchone()["path"], str(stuck))
 
     def test_transcribed_audio_is_deleted_and_not_revisited(self):
         inbox = Inbox(self.root)

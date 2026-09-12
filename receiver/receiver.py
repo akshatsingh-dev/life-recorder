@@ -162,7 +162,13 @@ class Inbox:
                                   "AND path<>''").fetchall()
             removed = []
             for row in rows:
-                Path(row["path"]).unlink(missing_ok=True)
+                try:
+                    Path(row["path"]).unlink(missing_ok=True)
+                except OSError:
+                    # The transcript is already durable; a stuck file must not
+                    # fail the chunk. Leaving `path` set is what marks the row
+                    # for the next sweep.
+                    continue
                 removed.append((row["id"],))
             if removed:
                 db.executemany("UPDATE chunks SET path='' WHERE id=?", removed)
@@ -233,6 +239,13 @@ class Inbox:
             day_file = self.days / (row["started"][:10] + ".md")
             if not self._unchanged(life, state.get("life_size")):
                 return False
+            same_day = row["started"][:10] == state.get("day")
+            # A day file that is not the one we left -- truncated, rotated or
+            # deleted -- can only be put right by a rebuild. Checked before the
+            # silent-clip branch below, so a rejected clip cannot advance the
+            # watermark past a file nobody validated.
+            if same_day and not self._unchanged(day_file, state.get("day_size")):
+                return False
             body = clean_transcript(row["transcript"])
             if not body:
                 # Nothing to write, but the watermark still advances so the next
@@ -240,15 +253,11 @@ class Inbox:
                 self._remember(db, (row["started"], row["id"]), state.get("hour"), life)
                 return True
             hour = row["started"][:13]
-            if hour == state.get("hour") and day_file.exists():
-                if not self._unchanged(day_file, state.get("day_size")):
-                    return False
+            if hour == state.get("hour") and same_day:
                 section = body + "\n\n"
             else:
                 section = f"### {hour.replace('T', ' ')}:00 UTC\n\n{body}\n\n"
-            if day_file.exists() and row["started"][:10] == state.get("day"):
-                if not self._unchanged(day_file, state.get("day_size")):
-                    return False
+            if same_day:
                 append_write(day_file, section.encode())
             else:
                 atomic_write(day_file, (f"# {row['started'][:10]}\n\n" + section).encode())
